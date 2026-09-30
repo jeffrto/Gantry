@@ -148,7 +148,30 @@ Item {
                     }
                 }
             }
+
+            // The restart timer gives up on a runtime that was down at the time,
+            // so a runtime that comes up later needs its listener started here.
+            readonly property var availabilityWatcher: Connections {
+                target: root
+                function onRuntimeAvailableChanged() {
+                    if (root.runtimeAvailable[listener.modelData.id] && !listener.eventsProcess.running) {
+                        console.log(`Gantry[${listener.modelData.id}]: runtime came up, starting events listener`);
+                        listener.eventsProcess.running = true;
+                    }
+                }
+            }
         }
+    }
+
+    // A socket-activated daemon, or a slow first `podman info` after login, can
+    // miss the startup check. Nothing else would ever check again, so keep
+    // retrying while an enabled runtime is down. Longer than the check timeout,
+    // so rounds do not overlap.
+    property var retryTimer: Timer {
+        interval: 30000
+        running: root.enabledRuntimes.some(rt => !root.runtimeAvailable[rt.id])
+        repeat: true
+        onTriggered: refresh(true)
     }
 
     property var pollingTimer: Timer {
@@ -173,7 +196,14 @@ Item {
     // apart and dropped, instead of decrementing the current round's counter.
     property int checkGeneration: 0
 
-    function refresh() {
+    // Timeout for the availability check. Proc's default of 10s is about what
+    // a socket-activated dockerd takes to come up, so it was hit at login.
+    readonly property int checkTimeout: 20000
+
+    // onlyIfChanged skips the container fetch when availability is unchanged,
+    // so the retry timer does not turn into polling for a runtime that is
+    // simply not installed.
+    function refresh(onlyIfChanged) {
         const targets = enabledRuntimes;
         const generation = ++checkGeneration;
         const results = {};
@@ -181,7 +211,7 @@ Item {
 
         if (pending === 0) {
             console.log("Gantry: no runtime enabled");
-            applyAvailability(generation, results);
+            applyAvailability(generation, results, onlyIfChanged);
             return;
         }
 
@@ -200,14 +230,24 @@ Item {
                 console.log(`Gantry[${rt.id}]: ${exitCode === 0 ? "available" : `unavailable (exit ${exitCode})`}`);
 
                 if (--pending === 0) {
-                    applyAvailability(generation, results);
+                    applyAvailability(generation, results, onlyIfChanged);
                 }
-            }, 100);
+            }, 100, checkTimeout);
         });
     }
 
-    function applyAvailability(generation, results) {
+    // Key by key: results are filled in whatever order the checks finish.
+    function availabilityDiffers(a, b) {
+        const ids = Object.keys(a).concat(Object.keys(b));
+        return ids.some(id => !!a[id] !== !!b[id]);
+    }
+
+    function applyAvailability(generation, results, onlyIfChanged) {
         if (generation !== checkGeneration) {
+            return;
+        }
+
+        if (onlyIfChanged && !availabilityDiffers(results, root.runtimeAvailable)) {
             return;
         }
 
